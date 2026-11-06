@@ -9,15 +9,20 @@ class CausalSelfAttention(nn.Module):
   def __init__(self, config):
     super().__init__()
     assert config.n_embd % config.n_head == 0, "Token embedding dimensionality must be divisible by number of heads."
+
+    # key, query and value projection for all heads, but in a batch
     self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd, bias=config.bias)
+    # output projection
     self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
+    # regularization (dropout)
     self.attn_dropout = nn.Dropout(config.dropout)
     self.resid_dropout = nn.Dropout(config.dropout)
 
+    # causal mask [1, 1, block_size, block_szie]
     self.register_buffer(
         "bias",
-        torch.tril(torch.ones(config.block_size, config.block_size))
+        torch.tril(torch.ones(config.block_size, config.block_size)) 
         .view(1, 1, config.block_size, config.block_size),
         persistent=False
     )
@@ -27,19 +32,23 @@ class CausalSelfAttention(nn.Module):
 
   def forward(self, x):
     B, T, C = x.shape
-    q, k, v = self.c_attn(x).split(self.n_embd, dim=2) # (B, T, d)
 
-    q = q.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2) # (B, H, T, d_k)
-    k = k.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
-    v = v.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
+    # calculate query, key, value for all heads in batch and move the head dim forward to be the batch dim
+    q, k, v = self.c_attn(x).split(self.n_embd, dim=2) # [B, T, 3d] -> [B, T, d]
+    q = q.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2) # [B, H, T, d_k]
+    k = k.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2) # [B, H, T, d_k]
+    v = v.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2) # [B, H, T, d_k]
 
-    attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.shape[-1]))  # (B, H, T, T)
+    # manual causal attention implementation
+    attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.shape[-1]))  # [B, H, T, T]
     attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
     attn = F.softmax(attn, dim=-1)
     attn = self.attn_dropout(attn)
-    y = attn @ v # (B, H, T, d)
-    y = y.transpose(1, 2).contiguous().view(B, T, C)
+    y = attn @ v # [B, H, T, T] @ [B, H, T, d] -> [B, H, T, d]
 
+    # re-assemble heads side-by-side
+    y = y.transpose(1, 2).contiguous().view(B, T, C) # [B, H, T, d] -> [B, T, H, d] -> [B, T, d]
+    # output projection + dropout
     y = self.resid_dropout(self.c_proj(y))
     return y
 
@@ -52,9 +61,9 @@ class MLP(nn.Module):
     self.dropout = nn.Dropout(config.dropout)
 
   def forward(self, x):
-    x = self.c_fc(x) # (B, T, 4d)
+    x = self.c_fc(x) # [B, T, 4d]
     x = self.gelu(x)
-    x = self.c_proj(x) # (B, T, d)
+    x = self.c_proj(x) # [B, T, d]
     x = self.dropout(x)
     return x
 
@@ -73,12 +82,12 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-  block_size: int = 1024
-  vocab_size: int = 50304
-  n_layer: int = 12
-  n_head: int = 12
-  n_embd: int = 768
-  dropout: float = 0.1
+  block_size: int = 256
+  vocab_size: int = 65
+  n_layer: int = 4
+  n_head: int = 4
+  n_embd: int = 256
+  dropout: float = 0.0
   bias: bool = False
 
 
@@ -92,16 +101,17 @@ class GPT(nn.Module):
     self.config = config
 
     self.transformer = nn.ModuleDict(dict(
-        wte = nn.Embedding(config.vocab_size, config.n_embd),
-        wpe = nn.Embedding(config.block_size, config.n_embd),
-        drop = nn.Dropout(config.dropout),
-        h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-        ln_f = nn.LayerNorm(config.n_embd)
+        wte = nn.Embedding(config.vocab_size, config.n_embd),               # token embeddings [V, d]
+        wpe = nn.Embedding(config.block_size, config.n_embd),               # position embeddings (fixed) [T, d]
+        drop = nn.Dropout(config.dropout),                                  # embedding dropout
+        h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),  # list of Transformer blocks
+        ln_f = nn.LayerNorm(config.n_embd)                                  # final layer normalization
     ))
 
-    self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+    self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # output layer
     self.lm_head.weight = self.transformer.wte.weight # weight tying
 
+    # init all weights
     self.apply(self._init_weights)
 
     # special init for the residual projections
@@ -126,27 +136,27 @@ class GPT(nn.Module):
 
   def forward(self, idx, targets=None):
     device = idx.device
-    _, T = idx.shape # (B, T)
+    _, T = idx.shape # [B, T]
     assert T <= self.config.block_size, f"Cannot forward sequence of size {T}. Max block size is only {self.config.block_size}"
-    pos = torch.arange(0, T, dtype=torch.long, device=device)  # (T)
+    pos = torch.arange(0, T, dtype=torch.long, device=device)  # [T]
 
-    tok_emb = self.transformer.wte(idx) # (B, T, d)
-    pos_emb = self.transformer.wpe(pos) # (B, T, d)
-    x = self.transformer.drop(tok_emb+pos_emb)
+    tok_emb = self.transformer.wte(idx) # [B, T, d]
+    pos_emb = self.transformer.wpe(pos) # [T, d]
+    x = self.transformer.drop(tok_emb+pos_emb) # [B, T, d]
 
     for block in self.transformer.h:
       x = block(x)
     x = self.transformer.ln_f(x)
 
     if targets is not None:
-      logits = self.lm_head(x) # (B, T, V)
+      logits = self.lm_head(x) # [B, T, V]
       loss = F.cross_entropy(
           logits.view(-1, logits.shape[-1]),
           targets.view(-1),
           ignore_index=-1
       )
     else:
-      logits = self.lm_head(x[:, -1, :]) # (B, V) - only use the last pos
+      logits = self.lm_head(x[:, -1, :]) # [B, V]  only use the last position
       loss = None
 
     return logits, loss
@@ -155,17 +165,18 @@ class GPT(nn.Module):
   def generate(self, idx, max_new_tok, temperature=1.0, top_k=None):
     assert temperature > 0
     for _ in range(max_new_tok):
+      # if the sequence context is too long, crop it at block_size 
       idx_cond = idx if idx.shape[1] <= self.config.block_size else idx[:, -self.config.block_size:]
-      logits, _ = self(idx_cond)
+      logits, _ = self(idx_cond) # [B, V]
       logits = logits / temperature
 
       if top_k is not None:
         assert top_k >= 1
-        v, _ = torch.topk(logits, min(top_k, logits.shape[-1])) # (B, k)
+        v, _ = torch.topk(logits, min(top_k, logits.shape[-1])) # [B, k]
         logits[logits < v[:, [-1]]] = -float('Inf')
 
-      probs = F.softmax(logits, dim=-1)
-      idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-      idx = torch.cat((idx, idx_next), dim=-1)
+      probs = F.softmax(logits, dim=-1) # [B, V]
+      idx_next = torch.multinomial(probs, num_samples=1) # [B, 1]
+      idx = torch.cat((idx, idx_next), dim=-1) # [B, T + 1]
     return idx
 

@@ -15,6 +15,11 @@ from torch.optim.lr_scheduler import (
     SequentialLR,
 )
 
+# ====================
+# Config
+# ====================
+
+# device
 device = select_device()
 dtype = torch.float16 if device == 'cuda' else torch.float32
 use_amp = device == 'cuda'
@@ -49,7 +54,7 @@ eval_batches = 20
 data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', dataset)
 checkpoint_path = os.path.join(data_dir, 'model.pt')
 
-
+# On CUDA, the returned context enables mixed precision
 def autocast_context():
     if use_amp:
         return torch.amp.autocast(device_type=device, dtype=dtype)
@@ -57,7 +62,8 @@ def autocast_context():
 
 
 def get_batch(data):
-    idx = np.random.randint(0, len(data) - block_size, (batch_size,)) # (B,)
+    # data [N]
+    idx = np.random.randint(0, len(data) - block_size, (batch_size,)) # [B,]
     x = torch.stack([
         torch.from_numpy(data[i:i+block_size].astype(np.int64)) for i in idx.tolist()
     ])
@@ -121,14 +127,15 @@ def main():
             raise ValueError(f'{split}.bin must contain more than {block_size} tokens.')
         datasets[split] = data
 
+    # init the model
     config = GPTConfig(
-        block_size=block_size,
-        vocab_size=meta_vocab_size,
-        n_layer=n_layer,
-        n_head=n_head,
-        n_embd=n_embd,
-        dropout=dropout,
-        bias=bias
+        block_size =block_size,
+        vocab_size = meta_vocab_size,
+        n_layer = n_layer,
+        n_head = n_head,
+        n_embd = n_embd,
+        dropout = dropout,
+        bias = bias
     )
     model = GPT(config).to(device)
     print(f"Model initialized with {model.get_num_params():,} parameters.")
@@ -138,6 +145,7 @@ def main():
     )
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
+    # scheduler setup
     warmup = LinearLR(
         optimizer,
         start_factor=1.0 / (warmup_iters + 1),
@@ -158,7 +166,6 @@ def main():
     history = []
     model.train()
 
-    # iter_num counts completed updates, including the final evaluation.
     for iter_num in range(max_iters + 1):
         if iter_num % eval_interval == 0 or iter_num == max_iters:
             losses = estimate_loss(model, datasets)
@@ -188,12 +195,14 @@ def main():
 
         X, Y = get_batch(datasets['train'])
         optimizer.zero_grad(set_to_none=True)
-        with autocast_context():
+        with autocast_context(): # mixed precision if device='cuda'
             _, loss = model(X, Y)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        # in case scaler skips optimizer update
         previous_scale = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
